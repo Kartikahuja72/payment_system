@@ -23,3 +23,11 @@ config/credentials/*.key
 
 # macOS
 .DS_Store
+
+# Claude Code internals
+.claude/
+
+# CI/CD and deployment — kept local only
+.github/
+.kamal/
+agents/
