@@ -1,0 +1,17 @@
+outbox_worker:
+  every: "5s"
+  class: OutboxWorkerJob
+  queue: outbox
+  description: "Polls pending outbox_events and publishes them to Kafka"
+
+pending_verification_checker:
+  every: "15m"
+  class: PendingVerificationCheckerJob
+  queue: reconciliation
+  description: "Finds payments stuck in pending_verification and pushes to reconciliation.required"
+
+daily_reconciliation:
+  cron: "0 0 * * *"
+  class: DailyReconciliationJob
+  queue: reconciliation
+  description: "Daily reconciliation of DB vs gateway settlement reports"

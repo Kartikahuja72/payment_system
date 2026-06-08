@@ -1,0 +1,25 @@
+# Ignore bundler config
+/.bundle
+
+# Ignore all logfiles and tempfiles
+/log/*
+/tmp/*
+!/log/.keep
+!/tmp/.keep
+
+# Ignore credentials and secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+config/master.key
+config/credentials/*.key
+
+# Ignore storage (uploaded files)
+/storage/*
+!/storage/.keep
+
+# Ignore node modules
+/node_modules
+
+# macOS
+.DS_Store

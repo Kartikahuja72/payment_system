@@ -1,0 +1,724 @@
+A large-scale payment system architecture needs to guarantee:
+
+No money loss
+No duplicate payment
+High availability
+Fault tolerance
+Event consistency
+Auditability
+Retry safety
+Gateway resiliency
+Scalability to millions of transactions
+Real-time observability
+
+
+                    ┌──────────────────┐
+                    │   Client / App   │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │   API Gateway    │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │ Payment Service  │
+                    │ (Sync Layer)     │
+                    └────────┬─────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          ▼                  ▼                  ▼
+ ┌──────────────┐  ┌────────────────┐  ┌─────────────────┐
+ │ PostgreSQL   │  │ Kafka Producer │  │ Redis Idempotency│
+ │ Transactions │  │ + Outbox Table │  │ + Distributed Lock│
+ └──────┬───────┘  └────────────────┘  └─────────────────┘
+        │
+        ▼
+ ┌─────────────────────────────────────────────┐
+ │                 KAFKA                       │
+ └─────────────────────────────────────────────┘
+        │                │                 │
+        ▼                ▼                 ▼
+┌─────────────┐  ┌──────────────┐  ┌───────────────┐
+│ Gateway     │  │ Ledger       │  │ Notification  │
+│ Processor   │  │ Service      │  │ Service       │
+└─────┬───────┘  └──────┬───────┘  └───────────────┘
+      │                  │
+      ▼                  ▼
+┌─────────────┐  ┌────────────────┐
+│ Payment     │  │ Double Entry   │
+│ Gateway     │  │ Accounting DB  │
+└─────┬───────┘  └────────────────┘
+      │
+      ▼
+┌───────────────┐
+│ Webhook Layer │
+└─────┬─────────┘
+      ▼
+┌────────────────┐
+│ Reconciliation │
+│ + Retry Engine │
+└────────────────┘
+
+
+2. Core Principles
+
+A. Payment Must Be Stateful
+
+Never treat payments as simple API calls.
+
+Each payment should have a lifecycle:
+
+CREATED
+PENDING
+PROCESSING
+AUTHORIZED
+CAPTURED
+FAILED
+REFUNDED
+REVERSED
+SETTLED
+
+Every transition must be persisted.
+
+3. Payment Flow
+
+Step 1: Client Initiates Payment
+
+Client calls:
+
+POST /payments
+
+Request:
+
+{
+  "order_id": "ORD123",
+  "amount": 1000,
+  "currency": "INR",
+  "payment_method": "UPI"
+}
+
+
+Step 2: Generate Idempotency Key
+
+Critical.
+
+User may:
+
+click twice
+refresh
+network retry
+mobile resend
+
+Use:
+
+Idempotency-Key: uuid
+
+Store in Redis/MySQL:
+
+key -> payment_id
+
+If same request comes:
+
+return previous response
+NEVER create duplicate payment
+
+4. Database Design
+
+Use MySQL.
+
+payments table
+payments
+---------
+id
+order_id
+amount
+currency
+status
+gateway
+gateway_payment_id
+version
+created_at
+updated_at
+
+payment_events table
+
+Immutable event store.
+
+payment_events
+---------------
+id
+payment_id
+event_type
+payload
+created_at
+
+This becomes:
+
+audit trail
+recovery source
+replay mechanism
+
+5. Kafka Architecture
+
+Kafka is backbone for async processing.
+
+Topics
+payment.created
+payment.processing
+payment.authorized
+payment.failed
+payment.refund
+payment.webhook.received
+ledger.entry.created
+notification.send
+reconciliation.required
+deadletter.payment
+
+
+
+6. Transactional Outbox Pattern (VERY IMPORTANT)
+
+Biggest issue:
+
+DB updated
+BUT Kafka publish failed
+
+or:
+
+Kafka published
+BUT DB rollback happened
+
+This causes money inconsistency.
+
+Solution: Outbox Pattern
+
+Inside SAME DB transaction:
+
+BEGIN;
+
+INSERT INTO payments(...);
+
+INSERT INTO outbox_events(...);
+
+COMMIT;
+
+Then background worker publishes outbox events to Kafka.
+
+This guarantees:
+
+no lost events
+atomicity
+
+
+7. Kafka Consumer Design
+
+Consumers must be:
+
+idempotent
+retry-safe
+replay-safe
+
+
+Consumer Rules
+NEVER:
+consume -> process -> commit
+ALWAYS:
+consume
+persist result
+commit offset
+Deduplication
+
+Every Kafka event contains:
+
+{
+  "event_id": "uuid",
+  "payment_id": "123"
+}
+
+Consumer stores processed event IDs.
+
+If replay happens:
+
+ ->ignore duplicate
+
+
+ 8. Payment Gateway Integration Layer
+
+  Never couple business logic directly with gateway.
+
+  Create:
+
+  Gateway Abstraction Layer
+
+  Example:
+
+  interface PaymentGateway
+    authorize()
+    capture()
+    refund()
+    void()
+
+  Implementations:
+
+  RazorpayGateway
+  StripeGateway
+  PayUGateway
+  CashfreeGateway
+
+  This allows:
+
+  gateway switching
+  failover routing
+  A/B routing
+  retries
+
+
+9. Gateway Failure Handling
+
+Payment gateways fail frequently.
+
+Scenarios:
+
+timeout
+502
+partial success
+callback delayed
+duplicate callback
+network disconnect
+
+
+10. MOST IMPORTANT EDGE CASE
+Gateway Timeout After Debit
+
+Scenario:
+
+User paid
+Bank debited money
+Gateway timed out
+
+Your system DOES NOT know success/failure.
+
+NEVER mark failed immediately.
+
+Mark:
+
+UNKNOWN / PENDING_VERIFICATION
+
+Then:
+
+poll gateway
+wait webhook
+reconciliation later
+
+This is where most payment bugs happen.
+
+
+11. Webhook System
+
+Gateways send async webhook.
+
+Must support:
+
+duplicate webhook
+delayed webhook
+out-of-order webhook
+Webhook Design
+
+Webhook service:
+
+validates signature
+stores raw payload
+ACKs quickly
+pushes to Kafka
+
+Never process heavy logic synchronously.
+
+
+13. Double Entry Ledger (CRITICAL)
+
+Never trust payment table for balance.
+
+Use accounting ledger.
+
+Ledger Entries
+User Wallet      -100
+Platform Holding +100
+
+Every transaction:
+
+debit + credit
+sum = 0
+
+Immutable ledger.
+
+Never UPDATE balances directly.
+
+
+14. Exactly Once Processing
+
+True exactly-once doesn't fully exist distributedly.
+
+Use:
+
+at-least-once Kafka
+idempotent consumers
+dedupe keys
+
+This gives EFFECTIVE exactly-once.
+
+
+15. Retry Strategy
+
+Retries need:
+
+exponential backoff
+jitter
+max retry count
+
+Example:
+
+1 sec
+5 sec
+30 sec
+2 min
+10 min
+
+
+
+16. Dead Letter Queue (DLQ)
+
+If event fails repeatedly:
+
+payment.failed.processing
+
+Move to:
+
+deadletter.payment
+
+Never lose event.
+
+
+17. Reconciliation Engine (SUPER IMPORTANT)
+
+Banks and gateways WILL mismatch.
+
+Daily reconciliation job compares:
+
+Internal DB
+vs
+Gateway settlement reports
+vs
+Bank reports
+
+Cases:
+
+money deducted but no record
+success internally but failed at gateway
+refund mismatch
+
+This is what actually saves money in production.
+
+
+18. Distributed Locking
+
+Needed for:
+
+same order processed twice
+concurrent webhook + polling
+
+Use:
+
+Redis Redlock
+DB row locking
+
+Example:
+
+SELECT ... FOR UPDATE;
+
+
+19. Saga Pattern for Multi-Step Payments
+
+Example:
+
+Reserve inventory
+Create payment
+Create invoice
+Send email
+
+If payment fails:
+
+compensate inventory
+
+Use orchestration/choreography.
+
+Kafka events help here.
+
+
+
+NOw IMportant Missing things--------------------------?
+
+1. Missing: Payment State Machine Validation
+
+Right now you only listed statuses.
+
+But you did not define:
+
+which transitions are allowed
+who can change state
+concurrency handling
+
+This is a BIG issue.
+
+Problem Scenario
+
+Webhook says:
+
+SUCCESS
+
+At same time retry worker says:
+
+FAILED
+
+Without transition validation:
+
+payment can become inconsistent
+
+Example:
+
+SUCCESS -> FAILED
+
+which should never happen.
+
+
+Valid State Transitions
+
+CREATED -> PENDING
+PENDING -> PROCESSING
+PROCESSING -> AUTHORIZED
+AUTHORIZED -> CAPTURED
+CAPTURED -> SETTLED
+PROCESSING -> FAILED
+
+FAILED -> SUCCESS only via reconciliation
+
+
+2. Missing: Optimistic Locking / Version Control
+
+You added:
+
+version
+
+VERY GOOD.
+
+But you did not explain how it prevents race conditions.
+
+Problem Scenario
+
+Two workers update same payment:
+
+webhook consumer
+reconciliation worker
+
+Both read:
+
+version = 5
+
+Both update.
+
+One overwrites another.
+
+Money inconsistency possible.
+
+Add This
+UPDATE payments
+SET status = 'SUCCESS',
+    version = version + 1
+WHERE id = 123
+AND version = 5;
+
+If rows affected = 0:
+
+retry operation
+
+
+3. Missing: Partition Key Strategy in Kafka
+
+You mentioned Kafka topics.
+
+But not partition strategy.
+
+VERY IMPORTANT.
+
+Problem Scenario
+
+If events go to random partitions:
+
+payment.success
+
+can process BEFORE:
+
+payment.created
+
+because Kafka ordering is only guaranteed INSIDE partition.
+
+Add This
+Kafka partition key = payment_id
+
+This guarantees:
+
+all events for same payment stay ordered
+Why Important
+
+This is classic distributed systems knowledge.
+
+
+4. Missing: Idempotency for Refunds & Webhooks
+
+You added API idempotency.
+
+Good.
+
+But refunds/webhooks ALSO need idempotency.
+
+Problem Scenario
+
+Gateway retries webhook 10 times.
+
+Without dedupe:
+
+refund processed multiple times
+duplicate notifications
+double ledger entries
+Add This
+processed_webhooks
+processed_refunds
+
+Store unique event/reference IDs.
+
+
+5. Missing: Reconciliation Trigger for UNKNOWN Payments
+
+You mentioned:
+
+PENDING_VERIFICATION
+
+Excellent.
+
+But what triggers reconciliation?
+
+Need explicit flow.
+
+Add This
+UNKNOWN payments older than 15 mins
+→ pushed to reconciliation.required topic
+→ reconciliation worker polls gateway
+Why Important
+
+Otherwise pending payments stay forever stuck.
+
+
+6. Missing: Database Constraints
+
+VERY IMPORTANT.
+
+Right now duplicates can still happen at DB level.
+
+Add This
+UNIQUE(order_id)
+UNIQUE(gateway_payment_id)
+UNIQUE(idempotency_key)
+Why Important
+
+Application bugs happen.
+
+DB constraints are final safety net.
+
+Senior engineers ALWAYS look for this.
+
+
+7. Missing: Retry Classification
+
+Right now:
+
+retry everything
+
+is dangerous.
+
+Problem
+
+Some errors should NEVER retry.
+
+Example:
+
+INVALID_CARD
+
+Retry useless.
+
+But:
+
+TIMEOUT
+
+should retry.
+
+Add This
+Retryable:
+- timeout
+- 502
+- temporary network failure
+
+Non-Retryable:
+- invalid card
+- insufficient funds
+- authentication failure
+
+
+8. Missing: Correlation IDs / Trace IDs
+
+Production debugging becomes impossible without this.
+
+Add This
+
+Every request/event contains:
+
+trace_id
+payment_id
+order_id
+event_id
+Why Important
+
+This makes logs traceable across:
+
+API
+Kafka
+webhook
+ledger
+reconciliation
+
+
+
+9. Missing: Raw Webhook/Event Storage
+
+VERY IMPORTANT.
+
+Store raw gateway payloads.
+
+Why
+
+Production debugging.
+
+Example:
+
+Why did payment fail?
+
+Need exact original payload.
+
+Add Table
+gateway_webhook_logs
+
+with:
+
+headers
+payload
+signature
+received_at

@@ -1,0 +1,22 @@
+<h2>Invoice Generated</h2>
+<p>Hi,</p>
+<p>Your invoice for order <strong><%= @payment.order_id %></strong> is ready.</p>
+<table style="border-collapse: collapse; width: 100%; max-width: 500px;">
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Invoice Number</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong><%= @invoice.invoice_number %></strong></td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Order ID</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><%= @payment.order_id %></td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><%= @invoice.currency %> <%= @invoice.amount / 100.0 %></td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Issued At</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><%= @invoice.issued_at.strftime("%d %b %Y, %H:%M") %></td>
+  </tr>
+</table>
+<p>Thank you for your business.</p>

@@ -1,0 +1,48 @@
+Even with all previous phases working perfectly, real-world scenarios create gaps:
+
+Gateway timeout after debit — user paid, bank debited, your server never got the response. Payment sits in pending_verification forever without reconciliation.
+Gateway shows success, your DB shows failed — Karafka consumer crashed after gateway responded but before DB was updated.
+Amount mismatch — Razorpay settled ₹499 but you recorded ₹500 (fee deducted by gateway).
+Refund processed at gateway, missing in your system — someone issued a refund directly from Razorpay dashboard, no webhook arrived.
+
+
+Reconciliation is the system that automatically finds and fixes these gaps every day.
+
+Two separate flows
+
+
+Flow 1 — Real-time: PENDING_VERIFICATION payments
+For the gateway-timeout-after-debit scenario specifically. These payments need to be checked urgently — not waited until the nightly batch.
+
+
+Payment sits in pending_verification for 15 minutes
+  ↓
+PendingVerificationCheckerJob fires (every 15 min)
+  ↓
+Publishes to reconciliation.required Kafka topic
+  ↓
+ReconciliationConsumer polls gateway API
+  ↓
+Gateway says success → payment.reconcile_success! → captured
+Gateway says failed  → payment.fail!
+Gateway inconclusive → stays pending_verification → alert fires
+
+
+Flow 2 — Batch: Daily settlement reconciliation
+Compares your entire DB against the gateway's settlement report for the previous day.
+
+
+Midnight → DailyReconciliationJob fires
+  ↓
+Fetches all payments from last 24h from DB
+Fetches settlement report from Razorpay/Stripe API
+  ↓
+Compares each record:
+  Match               → nothing to do
+  Amount mismatch     → create ReconciliationMismatch, alert
+  Status mismatch     → create ReconciliationMismatch, attempt auto-fix
+  In gateway not DB   → create ReconciliationMismatch, alert (critical)
+  In DB not gateway   → create ReconciliationMismatch, alert
+  ↓
+Auto-fixable cases → publish to reconciliation.required → ReconciliationConsumer resolves
+Non-auto-fixable   → ReconciliationMismatch record stays open for manual review

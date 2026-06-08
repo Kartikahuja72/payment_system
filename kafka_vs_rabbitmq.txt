@@ -1,0 +1,70 @@
+
+                           RabbitMQ	                                             Kafka         
+Model	                     Push — broker pushes to consumer	                     Pull — consumer polls broker
+Message storage	           Deleted after ACK	                                   Retained for 7 days (configurable)
+Ordering	                 Per-queue, not guaranteed across consumers	           Guaranteed within a partition
+Replay	                   Not possible — message gone after ACK	               Yes — seek to any offset
+Throughput	               ~50k msg/sec	                                         ~1M msg/sec
+Consumer groups	           Competing consumers (one gets the message)	           Each consumer group gets all messages independently
+Best for	                 Task queues, request-reply, routing	                 Event streaming, audit logs, replay
+
+
+The key difference for a payment system:
+
+
+RabbitMQ model:
+payment.created → [queue] → Consumer A gets it
+                             Consumer B gets nothing
+
+Kafka model:
+payment.created → [topic] → Consumer Group 1 (PaymentCreatedConsumer) reads it
+                           → Consumer Group 2 (LedgerEntryConsumer) reads it INDEPENDENTLY
+                           → Consumer Group 3 (NotificationConsumer) reads it INDEPENDENTLY
+
+
+With RabbitMQ, if you want ledger AND notification to both react to payment.authorized, you need to set up two separate queues with routing rules (fan-out exchange). With Kafka, you just have two consumer groups — each gets a full copy of every message automatically.
+No replay in RabbitMQ is the biggest problem for payments. If your ledger service was down for 2 hours, all payment.authorized messages that arrived during that time are gone. With Kafka, the ledger service restarts, reads from its last committed offset, and processes all missed events.
+
+
+Why Kafka is the right choice here
+1. Ordering per payment_id (partition key)
+
+We set partition_key = payment_id. All events for payment #123 go to partition 2 (for example). Kafka guarantees ordering within a partition.
+
+Partition 2: [payment.created] → [payment.processing] → [payment.authorized] → [payment.captured]
+Consumer processes them in exact order. Never see authorized before created.
+
+
+
+2. Multiple independent consumers
+
+
+payment.authorized topic
+  → PaymentAuthorizedConsumer  (updates state)
+  → LedgerEntryConsumer        (records accounting)
+  → NotificationConsumer       (sends email)
+All three get the same message independently. Adding a fourth consumer (e.g. analytics) requires zero changes to existing code.
+
+
+
+
+3. Replay — the killer feature for payments
+
+
+Bug deployed at 2pm, fixed at 4pm.
+LedgerEntryConsumer had a bug for 2 hours.
+200 payments went through without ledger entries.
+
+With Kafka: seek ledger consumer back to 2pm offset → replay all 200 events
+With RabbitMQ/Resque: those messages are gone forever
+
+
+4. Outbox pattern works naturally with Kafka
+
+The outbox table + Kafka is a well-established pattern specifically for financial systems. The outbox guarantees atomicity (payment + event in same DB transaction). Kafka guarantees delivery. Together they give you exactly-once effective processing.
+
+
+
+5. Audit trail is built-in
+
+Every payment.created, payment.authorized, payment.captured event is stored in Kafka for 7 days. This is your event log — separate from payment_events table. Useful for compliance, debugging, reconciliation.

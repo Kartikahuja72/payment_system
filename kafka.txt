@@ -1,0 +1,490 @@
+Kafka Internals, Cluster Management, KRaft & Karafka
+
+Part 1: How Kafka Works Internally
+
+The fundamental unit — the Log
+
+Kafka is, at its core, an append-only distributed log. Every topic-partition is
+physically just a directory of files on disk:
+
+/kafka-data/
+  payment.captured-0/         ← partition 0 of topic "payment.captured"
+    00000000000000000000.log   ← segment file (actual messages)
+    00000000000000000000.index ← offset→byte position index
+    00000000000000000000.timeindex
+    00000000000001234567.log   ← new segment (rolled when size limit hit)
+    leader-epoch-checkpoint
+
+segment is a chunk of the log. Kafka rolls a new segment when the current
+one hits log.segment.bytes (default 1GB) or log.roll.ms (default 7 
+days). Old segments are deleted/compacted based on retention policy.
+
+When does Kafka cut a new segment?
+
+Either:
+  current segment file size > 1GB (log.segment.bytes)
+  OR
+  segment is older than 7 days (log.roll.ms)
+
+→ close current segment, open a new one
+
+Why does this matter for deletion?
+
+Kafka's retention says "keep only last 7 days of messages." But it cannot delete individual messages from inside a file — it deletes entire segment files.
+
+Today is Day 10.
+  segment 1: Day 1–2 → DELETE (entire file gone)
+  segment 2: Day 3–4 → DELETE
+  segment 3: Day 5–6 → DELETE
+  segment 4: Day 7–8 → keep
+  segment 5: Day 9–10 → keep (active)
+So a message from Day 6 might actually survive until Day 7+, because Kafka waits until the entire segment is old enough to delete. This is why retention is approximate, not exact.
+
+
+The index file is a sparse index — not every offset, but every ~4KB of log
+data. Kafka binary searches the index to jump to the approximate byte position, then scans forward.
+
+
+The Sparse Index — why Kafka doesn't index every offset
+An index answers the question: "I want offset 5432 — which byte position in the .log file should I start reading from?"
+
+Option A: Index every single offset
+
+offset 0    → byte 0
+offset 1    → byte 156
+offset 2    → byte 289
+offset 3    → byte 401
+...
+offset 5432 → byte 847392
+If a segment has 10 million messages, this index has 10 million rows. Too big — defeats the purpose.
+
+Option B (what Kafka does): Sparse index — one entry per ~4KB of log data
+
+.index file:
+  offset 0      → byte 0
+  offset 47     → byte 4096      ← after ~4KB of log data
+  offset 91     → byte 8192
+  offset 138    → byte 12288
+  offset 5400   → byte 843776
+  offset 5447   → byte 847872
+The index skips huge chunks. Way smaller file, fits in memory easily.
+
+How Kafka finds offset 5432
+
+Step 1 — Binary search the .index file
+  (it's sorted by offset, so binary search works)
+
+  Is 5432 between 5400 and 5447? YES
+  → jump to byte 843776 in the .log file
+
+Step 2 — Scan forward from byte 843776
+
+  Read message at offset 5400 → not what we want, keep going
+  Read message at offset 5401 → not what we want, keep going
+  ...
+  Read message at offset 5432 → FOUND IT
+The scan is tiny — at most ~4KB of data to scan (the gap between index entries). So:
+
+Binary search in index  →  O(log n)  — fast, tiny file
+Forward scan in log     →  O(1) effectively — max 4KB scan
+
+Offsets
+An offset is a monotonically increasing integer — the position of a message
+within a partition. It never resets, never decreases.
+
+Partition 0:
+  offset 0 → { payment_id: 1, amount: 500 }
+  offset 1 → { payment_id: 2, amount: 200 }
+  offset 2 → { payment_id: 3, amount: 750 }
+                                              ← consumer committed here
+  offset 3 → { payment_id: 4, amount: 100 }  ← consumer reads next
+
+This is why your ApplicationConsumer calls mark_as_consumed! — it tells
+Kafka "I processed up to this offset, if I crash and restart, resume from
+offset+1."
+
+Offsets are stored in __consumer_offsets — a special internal Kafka topic
+with 50 partitions by default. That's why our Docker setup needed KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 — on a single broker, you can't replicate 3 ways.
+
+Partitions — the parallelism unit
+
+A topic with 6 partitions (like ours) means
+
+topic: payment.captured
+  partition 0 → stored on broker 1 (leader), replicated to broker 2 (follower)
+  partition 1 → stored on broker 2 (leader), replicated to broker 3 (follower)
+  partition 2 → stored on broker 3 (leader), replicated to broker 1 (follower)
+  partition 3 → stored on broker 1 (leader), replicated to broker 2 (follower)
+  partition 4 → stored on broker 2 (leader), replicated to broker 3 (follower)
+  partition 5 → stored on broker 3 (leader), replicated to broker 1 (follower)
+
+
+Producers write to the leader only. Followers pull from the leader to stay in sync.
+Consumers also read from the leader (Kafka 2.4+ added replica.selector 
+for follower reads but it's rarely used).
+
+
+
+Partition key determines which partition a message goes to:
+
+# from your KafkaProducer
+partition_key: payment.id
+
+
+Kafka computes: partition = hash(partition_key) % num_partitions
+Same payment_id → always same partition → ordering guaranteed per 
+payment. This is why you set partition_key = payment_id — all events 
+for payment #42 land in the same partition, in order.
+
+Replication — ISR
+
+ISR = In-Sync Replicas. A follower is "in sync" if it has caught up to within replica.lag.time.max.ms (default 30s) of the leader.
+
+Leader (broker 1):  offset 500 ←─── producer writes here
+ISR follower (broker 2): offset 498  ← still in sync (lag < 30s)
+Lagging follower (broker 3): offset 200  ← kicked from ISR
+
+acks=all (what produce_sync uses by default) means: wait until ALL ISR 
+replicas have written the message. This is the strongest durability 
+guarantee. The producer call doesn't return until broker 2 confirms too.
+
+If the leader crashes, Kafka elects a new leader from ISR only. A lagging 
+follower can never become leader — it would lose messages.
+
+What the 6 partitions still give you even on 1 broker:
+
+
+Parallelism:
+  Karafka worker 1 → reads partition 0
+  Karafka worker 2 → reads partition 1
+  Karafka worker 3 → reads partition 2
+  Karafka worker 4 → reads partition 3
+  Karafka worker 5 → reads partition 4
+  Karafka worker 6 → reads partition 5
+  → 6 payments processed simultaneously
+
+Partitions give you parallelism. Replication gives you fault tolerance. On local you get the parallelism benefit, just without the safety net.
+
+What you lose with replication_factor: 1:
+
+
+Broker 1 crashes
+→ all 6 partitions gone
+→ no follower to elect as new leader
+→ Kafka is completely down until broker restarts
+→ any messages not yet flushed to disk are lost
+
+
+Consumer Groups
+
+Consumer Group: "payment-processor"
+  Consumer A (Karafka worker 1) → assigned partitions 0, 1
+  Consumer B (Karafka worker 2) → assigned partitions 2, 3
+  Consumer C (Karafka worker 3) → assigned partitions 4, 5
+
+One partition can only be assigned to one consumer in the group at a time. This is the ordering 
+guarantee. If consumer A crashes, Kafka triggers a rebalance — partitions 0, 1 get reassigned to B or C.
+
+If you have more consumers than partitions, the extras sit idle. That's why you scaled to 6 partitions — 
+you can run up to 6 parallel Karafka workers per topic.
+
+Message retention — two modes
+Delete policy (default): keep messages for log.retention.hours (default 168 = 7 days). After that, 
+entire segments are deleted.
+
+Compaction policy: keep only the latest message per key. Used for state stores. Example: if you 
+publish {payment_id: 1, status: "captured"} then {payment_id: 1, status: "refunded"}, 
+compaction removes the first. The log becomes a snapshot of current state per key.
+
+
+
+Part 2: ZooKeeper Era — How Clusters Were Managed Before
+
+In Kafka ≤ 3.x (before KRaft stabilized), Apache ZooKeeper managed all cluster metadata:
+
+Part 2: ZooKeeper Era — How Clusters Were Managed Before
+In Kafka ≤ 3.x (before KRaft stabilized), Apache ZooKeeper managed all cluster metadata:
+
+
+ZooKeeper ensemble (3 or 5 nodes):
+  /brokers/ids/1  → {host: "broker1", port: 9092}
+  /brokers/ids/2  → {host: "broker2", port: 9092}
+  /brokers/topics/payment.captured/partitions/0/state
+    → {leader: 1, isr: [1,2], leader_epoch: 5}
+  /controller → {brokerid: 1}  ← which broker is the Controller
+  /consumers/payment-processor/offsets/...  ← (old, pre-2.0)
+
+
+The Controller is a special broker elected via ZooKeeper. It:
+
+Detects broker failures (ZooKeeper session expiry)
+Assigns partition leadership after failures
+Propagates metadata changes to all brokers
+
+Problems with ZooKeeper:
+
+Separate system to operate, monitor, and upgrade
+ZooKeeper has its own leader election — so you now have TWO consensus systems running
+Metadata scalability: ZooKeeper struggled with >200,000 partitions (large clusters)
+Controller failover: when the controller broker died, ZooKeeper elected a new one, but the new controller had to read ALL partition state from ZooKeeper — at 200k partitions this took 30-60 seconds of downtime
+Can't use Kafka's own tooling to monitor ZooKeeper
+
+
+Part 3: KRaft — Kafka without ZooKeeper
+
+KRaft = Kafka Raft. Proposed in KIP-500 (2020), production-ready in Kafka 3.3 (Oct 2022), 
+ZooKeeper fully removed in Kafka 4.0 (2024).
+
+What Raft is
+Raft is a distributed consensus algorithm — a way for a cluster of nodes to agree on a sequence of 
+facts even when some nodes crash or messages are delayed. Kafka's implementation is called the 
+metadata quorum.
+
+The key insight: Kafka already has a perfect abstraction for ordered, durable, replicated logs — 
+partitions. KRaft uses a single internal topic __cluster_metadata to store all cluster state. The 
+controllers ARE Kafka brokers that also run the Raft state machine.
+
+KRaft architecture
+
+3-node KRaft cluster:
+
+3-node KRaft cluster:
+
+┌─────────────────────────────────────────────────────┐
+│  Controller Quorum (subset of brokers, or dedicated) │
+│                                                       │
+│  Broker 1 (Active Controller) ◄── Raft leader        │
+│    writes to __cluster_metadata partition 0          │
+│                                                       │
+│  Broker 2 (Standby Controller)                       │
+│    replicates __cluster_metadata                     │
+│                                                       │
+│  Broker 3 (Standby Controller)                       │
+│    replicates __cluster_metadata                     │
+└─────────────────────────────────────────────────────┘
+        │ metadata fetch
+        ▼
+┌─────────────────────┐
+│  Broker nodes        │
+│  (data plane)        │
+└─────────────────────┘
+
+How Raft leader election works
+Every controller node votes. To become leader you need a majority (quorum):
+
+3 controllers → need 2 votes to lead
+5 controllers → need 3 votes to lead
+
+Normal operation:
+  Controller 1 (leader) sends heartbeats every election.timeout.ms
+
+  Controller 1 crashes:
+  Controllers 2 and 3 detect missing heartbeat
+  Controller 2 increments its epoch: "I'm running for epoch 6"
+  Controller 2 asks Controller 3 to vote → Controller 3 votes yes (2/3 = majority)
+  Controller 2 becomes leader for epoch 6
+  Broadcasts new metadata: "I am the controller now"
+  All brokers fetch updated metadata from Controller 2
+
+  Failover time: milliseconds, not 30-60 seconds. The new controller already has all 
+  metadata in its local __cluster_metadata log — no need to read from ZooKeeper.
+
+The metadata log
+Every cluster change is an event appended to __cluster_metadata:
+
+offset 0:  RegisterBrokerRecord    { brokerId: 1, host: "b1", port: 9092 }
+offset 1:  TopicRecord             { topicId: "abc", name: "payment.captured" }
+offset 2:  PartitionRecord         { topicId: "abc", partitionId: 0, leader: 1, isr: [1,2] }
+offset 3:  PartitionChangeRecord   { partitionId: 0, leader: 2 }  ← leader changed
+offset 4:  BrokerRegistrationRecord{ brokerId: 3, ... }           ← new broker joined
+
+Brokers periodically snapshot this log. A new broker joining the cluster replays the log 
+from the last snapshot to get current state.
+
+Part 4: Karafka Versions
+Karafka 2.x (current — what your project uses)
+Karafka 2.0 was a complete rewrite from 1.x. Major changes:
+
+
+# Gemfile — your project
+gem "karafka", "~> 2.5"
+gem "waterdrop", "~> 2.7"  # producer (separate gem from consumer)
+
+Architecture:
+
+Uses rdkafka (C binding to librdkafka) under the hood — not pure Ruby
+WaterDrop is the producer library, Karafka is the consumer framework
+Consumer groups, topics, routing all configured in karafka.rb
+Supports Virtual Partitions (run multiple threads per partition)
+Pro features: Enhanced DLQ, Long-Running Jobs, Scheduled Messages
+
+Without Virtual Partitions (your current setup)
+
+6 partitions → 6 Karafka consumer threads → 6 parallel messages processed
+
+  Thread 1 → partition 0 → processes payment_id: 1
+  Thread 2 → partition 1 → processes payment_id: 7
+  Thread 3 → partition 2 → processes payment_id: 13
+  Thread 4 → partition 3 → processes payment_id: 19
+  Thread 5 → partition 4 → processes payment_id: 25
+  Thread 6 → partition 5 → processes payment_id: 31
+
+Rule: 1 thread per partition. Thread 1 is locked to partition 0 — it processes 
+messages from partition 0 one by one, in order. While it's processing offset 5, 
+offsets 6, 7, 8 wait in queue.
+
+With Virtual Partitions (Karafka Pro feature)
+
+6 partitions, 3 virtual threads per partition → 18 parallel threads
+
+  Partition 0:
+    VThread 1 → processes payment_id: 1
+    VThread 2 → processes payment_id: 2   ← same partition, parallel!
+    VThread 3 → processes payment_id: 3
+
+  Partition 1:
+    VThread 4 → processes payment_id: 7
+    VThread 5 → processes payment_id: 8
+    VThread 6 → processes payment_id: 9
+  ...
+
+But there's a catch — you can only use Virtual Partitions when message order within 
+a partition doesn't matter. In your case:
+
+
+partition 0 messages for payment_id: 42:
+  offset 10 → payment.submit
+  offset 11 → payment.authorized
+  offset 12 → payment.captured
+
+If VThread 1 processes offset 12 before VThread 2 processes offset 10
+→ state machine gets capture before submit → crash
+
+So for your payment system, Virtual Partitions are not safe because ordering per
+payment matters. Your design is correct as-is — 6 partitions, 1 thread each, ordering 
+guaranteed.
+
+Our setup
+
+# karafka.rb — 2.x style
+class KarafkaApp < Karafka::App
+  setup do |config|
+    config.kafka = { "bootstrap.servers": ENV["KAFKA_BROKER"] }
+    config.client_id = "payment_system"
+  end
+
+  routes.draw do
+    topic "payment.captured" do
+      consumer PaymentCapturedConsumer
+      config(**TOPIC_CONFIG)
+      dead_letter_queue(topic: "deadletter.payment", max_retries: 3)
+    end
+  end
+end
+
+Part 4: Karafka Versions
+
+
+Karafka 2.x (current — what your project uses)
+
+
+
+Your Rails App
+     │
+     ├── WaterDrop  (PRODUCER — sends messages TO Kafka)
+     │
+     └── Karafka    (CONSUMER — receives messages FROM Kafka)
+                         │
+                         └── rdkafka (C library, talks actual Kafka protocol)
+                                  │
+                                  ▼
+                            Kafka Broker
+
+
+Karafka 2.0 was a complete rewrite from 1.x. Major changes:
+
+
+# Gemfile — your project
+gem "karafka", "~> 2.5"
+gem "waterdrop", "~> 2.7"  # producer (separate gem from consumer)
+Architecture:
+
+Uses rdkafka (C binding to librdkafka) under the hood — not pure Ruby
+WaterDrop is the producer library, Karafka is the consumer framework
+Consumer groups, topics, routing all configured in karafka.rb
+Supports Virtual Partitions (run multiple threads per partition)
+Pro features: Enhanced DLQ, Long-Running Jobs, Scheduled Messages
+
+
+Key 2.x concepts used in your project:
+
+mark_as_consumed! — commits offset (your golden rule: consume → persist → commit)
+already_processed? — checks processed_events table
+payload — the deserialized message
+DLQ — after 3 retries, message routed to deadletter.payment
+
+Karafka 3.x (in development as of mid-2025) planned changes:
+
+Swappable backends: swap rdkafka for pure-Ruby kafka-rb or ruby-kafka for environments where C extensions are problematic
+Better Web UI (already available in 2.x Pro, improved in 3.x)
+Declarative transactions: atomic produce + offset commit via Kafka transactions API
+Improved Virtual Partitions scheduling
+
+Kafka 4.0 + Karafka
+Kafka 4.0 (released early 2024):
+
+ZooKeeper completely removed — KRaft is the only mode
+Minimum Java 11 (Java 8 dropped)
+Fetch API improvements (faster consumer startup)
+kafka-topics.sh no longer accepts --zookeeper flag
+
+
+In KRaft, every node IS a broker process — but with different ROLES
+
+A Kafka node can have one of these roles:
+
+  KAFKA_PROCESS_ROLES: "broker"              ← data only
+  KAFKA_PROCESS_ROLES: "controller"          ← metadata only
+  KAFKA_PROCESS_ROLES: "broker,controller"   ← both (your local setup)
+
+
+Your local Docker setup
+
+KAFKA_PROCESS_ROLES: "broker,controller"
+
+One machine, one Kafka process, doing BOTH jobs:
+  - stores messages (broker role)
+  - manages cluster metadata (controller role)
+
+Fine for dev. Not for production.
+
+Production — they are SEPARATE machines
+
+These are NOT inside the 5 brokers.
+They are ADDITIONAL dedicated machines.
+
+  Machine 1  → role: controller   ← metadata only, no messages
+  Machine 2  → role: controller   ← metadata only, no messages
+  Machine 3  → role: controller   ← metadata only, no messages
+
+  Machine 4  → role: broker       ← stores messages
+  Machine 5  → role: broker       ← stores messages
+  Machine 6  → role: broker       ← stores messages
+  Machine 7  → role: broker       ← stores messages
+  Machine 8  → role: broker       ← stores messages
+
+Total: 8 machines
+  3 controller machines (metadata quorum)
+  5 broker machines     (data storage)
+
+Cluster = all your Kafka machines treated as ONE unit
+
+  Machine 1 (controller)  ┐
+  Machine 2 (controller)  │
+  Machine 3 (controller)  │  ← all together = ONE Kafka Cluster
+  Machine 4 (broker)      │
+  Machine 5 (broker)      │
+  Machine 6 (broker)      │
+  Machine 7 (broker)      │
+  Machine 8 (broker)      ┘
+

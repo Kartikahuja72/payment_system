@@ -1,0 +1,20 @@
+<h2>Payment Failed</h2>
+<p>Hi,</p>
+<p>Unfortunately, your payment for order <strong><%= @payment.order_id %></strong> could not be processed.</p>
+<table style="border-collapse: collapse; width: 100%; max-width: 500px;">
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Order ID</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><%= @payment.order_id %></td>
+  </tr>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Amount</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd;"><%= @payment.currency %> <%= @payment.amount / 100.0 %></td>
+  </tr>
+  <% if @error_message.present? %>
+  <tr>
+    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Reason</strong></td>
+    <td style="padding: 8px; border: 1px solid #ddd; color: red;"><%= @error_message %></td>
+  </tr>
+  <% end %>
+</table>
+<p>Please try again with a different payment method.</p>
