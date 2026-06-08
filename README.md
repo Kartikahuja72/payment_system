@@ -744,3 +744,153 @@ Every money movement creates two `ledger_entries` (debit + credit) in the same t
 
 ### Optimistic Locking
 The `payments` table has a `lock_version` column. Any concurrent state-machine transition (e.g. two consumers both trying to capture the same payment) will raise `ActiveRecord::StaleObjectError` on the second writer. The `WithOptimisticRetry` module handles retrying these safely.
+
+---
+
+## Concurrency and Locking
+
+Three distinct locking mechanisms are used depending on the threat model.
+
+### 1. Optimistic Locking — `lock_version` column
+
+**Where:** Every state-machine transition on `Payment` (authorize, capture, fail, refund, etc.)
+
+**How it works:** Rails automatically adds `lock_version` to every `UPDATE`:
+
+```sql
+-- What you write in Ruby:
+payment.capture!
+
+-- What Rails actually runs:
+UPDATE payments
+SET status = 'captured', lock_version = lock_version + 1
+WHERE id = 6 AND lock_version = 3   ← only succeeds if nobody else updated first
+```
+
+If two workers both read `lock_version = 3` and both try to write, only one succeeds. The second gets `0 rows affected` and Rails raises `ActiveRecord::StaleObjectError`.
+
+**Recovery:** `WithOptimisticRetry` (`app/modules/with_optimistic_retry.rb`) catches the error, re-reads the fresh record, and retries up to 3 times:
+
+```ruby
+module WithOptimisticRetry
+  MAX_RETRIES = 3
+
+  def with_lock_retry
+    retries = 0
+    begin
+      yield
+    rescue ActiveRecord::StaleObjectError
+      retries += 1
+      retry if retries < MAX_RETRIES
+      raise
+    end
+  end
+end
+```
+
+**The problem it solves:** Two Kafka consumers (e.g. a webhook consumer and a retry worker) reading the same payment simultaneously. Without `lock_version`, whoever writes last silently wins — a payment could end up `failed` even though the gateway said success.
+
+**lock_version progression for a normal payment:**
+```
+Payment.create!           → lock_version: 0
+payment.start_processing! → lock_version: 1
+payment.authorize!        → lock_version: 2
+payment.update!(          → lock_version: 3  (gateway_payment_id set)
+  gateway_payment_id: ...
+)
+payment.capture!          → lock_version: 4
+payment.refund!           → lock_version: 5
+```
+
+---
+
+### 2. Pessimistic Locking — `SELECT FOR UPDATE`
+
+**Where:** `ProcessRefundService` (`app/services/process_refund_service.rb`)
+
+**How it works:** Before checking whether a payment is refundable, the service acquires a row-level exclusive lock at the database level:
+
+```ruby
+@payment = Payment.lock("FOR UPDATE").find(@payment.id)
+```
+
+This translates to:
+```sql
+SELECT * FROM payments WHERE id = ? FOR UPDATE
+```
+
+MySQL locks the row for the duration of the current transaction. Any other connection attempting `FOR UPDATE` on the same row is blocked at the DB level until the first transaction commits or rolls back.
+
+**The problem it solves:** Two simultaneous refund requests (different idempotency keys) for the same captured payment:
+
+```
+Without FOR UPDATE:
+  Request A: payment.captured? → true  (no lock, reads freely)
+  Request B: payment.captured? → true  (no lock, reads freely)
+  Both call gateway.refund() → customer refunded TWICE
+
+With FOR UPDATE:
+  Request A: SELECT ... FOR UPDATE → row LOCKED
+  Request B: SELECT ... FOR UPDATE → WAITS at MySQL level
+  Request A: gateway.refund() → payment.refund! → COMMIT → row unlocked
+  Request B: row unlocked → reads status='refunded' → captured? false → error returned
+```
+
+**Why not use optimistic locking here?** Optimistic locking catches the conflict at write time — after both workers have already called the gateway. By then the second refund has already been sent. `FOR UPDATE` prevents both workers from even reaching the gateway call.
+
+---
+
+### 3. Redis Distributed Lock — `SET NX PX`
+
+**Where:** `PaymentLock` module (`app/modules/payment_lock.rb`)
+
+**How it works:** Uses Redis atomic `SET NX PX` to acquire a per-payment mutex across all processes and machines:
+
+```ruby
+module PaymentLock
+  LOCK_TTL_MS = 30_000   # auto-expires after 30s if worker crashes
+
+  def self.acquire(payment_id)
+    $redis.set("lock:payment:#{payment_id}", 1, nx: true, px: LOCK_TTL_MS)
+    # NX — set ONLY if key does Not eXist (atomic check-and-set)
+    # PX — expire after 30,000ms (crash safety)
+    # Returns true if acquired, nil if already held
+  end
+
+  def self.with_lock(payment_id)
+    acquired = acquire(payment_id)
+    raise PaymentLockError unless acquired
+    yield
+  ensure
+    release(payment_id) if acquired  # always release, even on crash
+  end
+end
+```
+
+**Why `SET NX PX` and not a regular check-then-set?**
+
+```ruby
+# WRONG — race condition between check and set:
+if $redis.get(key).nil?    # Worker A and B both pass this
+  $redis.set(key, 1)       # Both set it — lock acquired by BOTH
+end
+
+# CORRECT — atomic:
+$redis.set(key, 1, nx: true)  # Only ONE wins, the other gets nil
+```
+
+The Redis server executes `SET NX` as one indivisible operation. There is no window between "check if key exists" and "set the key" where a second worker can slip in.
+
+**The 30-second TTL:** If a worker crashes while holding the lock, Redis automatically expires the key after 30 seconds. Without TTL, a crashed worker would hold the lock forever and all further processing of that payment would be blocked.
+
+**The `ensure` block:** Guarantees the lock is always released even if the block raises an exception — no manual cleanup needed.
+
+---
+
+### When each lock is used
+
+| Scenario | Lock Used | Why |
+|---|---|---|
+| Two Kafka consumers racing to update the same payment state | Optimistic (`lock_version`) | Lightweight, no DB round-trip on the happy path |
+| Two HTTP refund requests arriving simultaneously | Pessimistic (`FOR UPDATE`) | Must block at read time — optimistic is too late (gateway already called) |
+| Two workers competing to process the same payment event | Redis `SET NX PX` | Cross-process mutex, not limited to DB transactions |
